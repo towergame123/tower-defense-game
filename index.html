@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>紫境塔防网页版</title>
+    <!-- 加载Pyodide运行环境 -->
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js"></script>
+    <style>
+        canvas {border:3px solid #9966bb;background:#3a1c50;margin:10px auto;display:block}
+        body {background:#221030;text-align:center;color:#fff;font-size:18px}
+    </style>
+</head>
+<body>
+<h2>紫境塔防游戏（网页版）</h2>
+<canvas id="game_canvas"></canvas>
+
+<script>
+async function runGame(){
+    // 初始化Python网页环境
+    let pyodide = await loadPyodide();
+    // 自动安装pygame库
+    await pyodide.loadPackage(["pygame","heapq","random"]);
+    // ========== 【关键】把你改好的完整Python代码粘贴到下面两个引号中间 ==========
+    const game_code = `
+import pygame
+import sys
+import heapq
+import random
+
+# ===================== 全局常量（缩小窗口适配小屏幕） =====================
+SCREEN_WIDTH = 880
+SCREEN_HEIGHT = 700
+FPS = 60
+CELL_SIZE = 32
+GRID_COLS = 20  # 横向0~19
+GRID_ROWS = 22
+# 起点终点自动切换间隔（秒）
+POINT_SWITCH_INTERVAL = 10
+
+# 紫色秘境主题配色
+BG_COLOR = (58, 28, 80)
+TITLE_TEXT_COLOR = (255, 255, 255)
+UI_BG = (38, 18, 52)
+GRID_LINE = (110, 70, 140)
+START_COLOR = (0, 220, 0)
+END_COLOR = (220, 0, 0)
+BLOCK_COLOR = (30, 12, 42)
+BTN_NORMAL = (90, 50, 120)
+BTN_HOVER = (150, 90, 180)
+BTN_TEXT = (255, 255, 255)
+GOLD_TEXT = (255, 220, 100)
+TIP_COLOR = (255, 255, 100)
+
+# 塔类型配置（新增升级参数）
+TOWER_CONFIG = {
+    "arrow": {
+        "name": "箭塔·小炮",
+        "cost": 50,
+        "range": 120,
+        "dmg": 10,
+        "cd": 0.8,
+        "color": (30, 200, 255),
+        "shape": "gun",
+        "upgrade_cost": [70, 120], # Lv1→Lv2, Lv2→Lv3
+        "dmg_add": 6,
+        "range_add": 15
+    },
+    "sniper": {
+        "name": "狙击塔·堡垒",
+        "cost": 120,
+        "range": 220,
+        "dmg": 35,
+        "cd": 1.8,
+        "color": (180, 30, 220),
+        "shape": "fort",
+        "upgrade_cost": [160, 240],
+        "dmg_add": 12,
+        "range_add": 30
+    },
+    "cannon": {
+        "name": "火炮塔·重炮塔",
+        "cost": 150,
+        "range": 90,
+        "dmg": 20,
+        "cd": 2.2,
+        "color": (220, 120, 0),
+        "splash": True,
+        "shape": "cannon",
+        "upgrade_cost": [200, 300],
+        "dmg_add": 10,
+        "range_add": 12
+    }
+}
+
+# 怪物类型配置
+ENEMY_CONFIG = {
+    "normal": {"hp": 50, "speed": 1, "reward": 30, "color": (220, 30, 30)},
+    "fast": {"hp": 25, "speed": 2.2, "reward": 20, "color": (255, 220, 0)},
+    "tank": {"hp": 150, "speed": 0.5, "reward": 80, "color": (80, 80, 80)}
+}
+
+BULLET_COLOR = (255, 255, 0)
+SPLASH_COLOR = (255, 100, 0)
+
+# 游戏状态
+STATE_MENU = 0
+STATE_MAP_SELECT = 1
+STATE_GAME = 2
+
+# 两张地图障碍物【全部修复x<=19，删除越界坐标】
+MAP_LIST = [
+    {
+        "name": "S弯紫境地图",
+        "start": (0, 4),
+        "end": (19, 18),
+        "blocks": [
+            (2, 2), (3, 2),
+            (8, 0), (8, 1), (8, 2), (8, 3),
+            (4, 6), (5, 6), (6, 6),
+            (4, 10), (5, 10), (6, 10), (7, 10),
+            (18, 14), (18, 15), (18, 16),
+            (12, 18), (13, 18), (14, 18),
+            (1, 15), (2, 15)
+        ]
+    },
+    {
+        "name": "迷宫紫境地图",
+        "start": (0, 0),
+        "end": (19, 21),
+        "blocks": [
+            [(5, y) for y in range(10)],
+            [(18, y) for y in range(14, 22)],
+            [(x, 12) for x in range(8, 16)],
+            (10, 4), (10, 5), (10, 6),
+            (13, 16), (13, 17), (13, 18),
+            (2, 3), (3, 3), (4, 3),
+            (15, 5), (16, 5), (17, 5),
+            (1, 14), (2, 14), (3, 14)
+        ]
+    }
+]
+
+# ===================== A*寻路算法 =====================
+class Node:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+        self.g = 0
+        self.h = 0
+        self.f = 0
+        self.parent = None
+    def __lt__(self, other):
+        return self.f < other.f
+
+class AStar:
+    def __init__(self, grid_data):
+        self.grid = grid_data
+        self.dir = [(1,0),(-1,0),(0,1),(0,-1)]
+        self.cols = GRID_COLS
+        self.rows = GRID_ROWS
+
+    def heuristic(self, x1,y1,x2,y2):
+        return abs(x1-x2)+abs(y1-y2)
+
+    def find_path(self, sx, sy, ex, ey):
+        start = Node(sx, sy)
+        end = Node(ex, ey)
+        open_list = []
+        close_set = set()
+        heapq.heappush(open_list, start)
+        while open_list:
+            cur = heapq.heappop(open_list)
+            close_set.add((cur.x, cur.y))
+            if cur.x == end.x and cur.y == end.y:
+                path = []
+                while cur:
+                    path.append((cur.x, cur.y))
+                    cur = cur.parent
+                return path[::-1]
+            for dx, dy in self.dir:
+                nx = cur.x + dx
+                ny = cur.y + dy
+                if 0<=nx<self.cols and 0<=ny<self.rows:
+                    if self.grid[ny][nx] == 1 or (nx, ny) in close_set:
+                        continue
+                    new_node = Node(nx, ny)
+                    new_node.g = cur.g + 1
+                    new_node.h = self.heuristic(nx, ny, ex, ey)
+                    new_node.f = new_node.g + new_node.h
+                    new_node.parent = cur
+                    exist = False
+                    for n in open_list:
+                        if n.x == nx and n.y == ny:
+                            exist = True
+                            if new_node.g < n.g:
+                                n.g = new_node.g
+                                n.f = new_node.f
+                                n.parent = cur
+                            break
+                    if not exist:
+                        heapq.heappush(open_list, new_node)
+        return None
+
+# ===================== 按钮类 =====================
+class Button:
+    def __init__(self, x, y, w, h, text, font, callback):
+        self.rect = pygame.Rect(x, y, w, h)
+        self.text = text
+        self.font = font
+        self.callback = callback
+        self.hover = False
+
+    def update_hover(self, mouse_pos):
+        self.hover = self.rect.collidepoint(mouse_pos)
+
+    def trigger_click(self):
+        self.callback()
+
+    def draw(self, screen):
+        fill_color = BTN_HOVER if self.hover else BTN_NORMAL
+        pygame.draw.rect(screen, fill_color, self.rect, border_radius=12)
+        text_surface = self.font.render(self.text, True, BTN_TEXT)
+        text_rect = text_surface.get_rect(center=self.rect.center)
+        screen.blit(text_surface, text_rect)
+
+# ===================== 子弹类 =====================
+class Bullet:
+    def __init__(self, x, y, target, dmg, splash=False):
+        self.x = x
+        self.y = y
+        self.target = target
+        self.damage = dmg
+        self.splash = splash
+        self.speed = 6
+        self.splash_radius = 40
+
+    def update(self, enemies):
+        dx = self.target.x - self.x
+        dy = self.target.y - self.y
+        dist = (dx**2 + dy**2)**0.5
+        if dist < 8:
+            self.target.hp -= self.damage
+            if self.splash:
+                for e in enemies:
+                    if e == self.target:
+                        continue
+                    d = ((self.x - e.x)**2 + (self.y - e.y)**2)**0.5
+                    if d < self.splash_radius:
+                        e.hp -= self.damage // 2
+            return True
+        self.x += dx / dist * self.speed
+        self.y += dy / dist * self.speed
+        return False
+
+    def draw(self, screen):
+        pygame.draw.circle(screen, BULLET_COLOR, (int(self.x), int(self.y)), 3)
+        if self.splash:
+            pygame.draw.circle(screen, SPLASH_COLOR, (int(self.x), int(self.y)), self.splash_radius, 1)
+
+# ===================== 敌人类 =====================
+class Enemy:
+    def __init__(self, path, enemy_type):
+        cfg = ENEMY_CONFIG[enemy_type]
+        self.type = enemy_type
+        self.path = path
+        self.path_idx = 0
+        gx, gy = self.path[0]
+        self.x = gx * CELL_SIZE + CELL_SIZE // 2
+        self.y = gy * CELL_SIZE + CELL_SIZE // 2
+        self.hp = cfg["hp"]
+        self.max_hp = cfg["hp"]
+        self.speed = cfg["speed"]
+        self.reward = cfg["reward"]
+        self.color = cfg["color"]
+
+    def update(self):
+        if self.path_idx >= len(self.path) - 1:
+            return True
+        tx, ty = self.path[self.path_idx + 1]
+        target_x = tx * CELL_SIZE + CELL_SIZE // 2
+        target_y = ty * CELL_SIZE + CELL_SIZE // 2
+        dx = target_x - self.x
+        dy = target_y - self.y
+        dist = (dx**2 + dy**2)**0.5
+        if dist < self.speed:
+            self.path_idx += 1
+        else:
+            self.x += dx / dist * self.speed
+            self.y += dy / dist * self.speed
+        return False
+
+    def draw(self, screen):
+        pygame.draw.circle(screen, self.color, (int(self.x), int(self.y)), 12)
+        hp_width = self.hp / self.max_hp * 24
+        pygame.draw.rect(screen, (0, 200, 0), (self.x - 12, self.y - 18, hp_width, 4))
+
+# ===================== 防御塔类【无炮头、无任何朝向】 =====================
+class Tower:
+    def __init__(self, gx, gy, tower_type):
+        self.gx = gx
+        self.gy = gy
+        self.x = gx * CELL_SIZE + CELL_SIZE // 2
+        self.y = gy * CELL_SIZE + CELL_SIZE // 2
+        self.tower_type = tower_type
+        self.cfg = TOWER_CONFIG[tower_type]
+        self.level = 1 # 初始1级
+        self.range = self.cfg["range"]
+        self.dmg = self.cfg["dmg"]
+        self.cd = self.cfg["cd"]
+        self.color = self.cfg["color"]
+        self.shape = self.cfg["shape"]
+        self.splash = self.cfg.get("splash", False)
+        self.last_shot = 0
+        self.target = None
+        self.total_cost = self.cfg["cost"] # 累计花费，用于出售
+
+    # 升级函数
+    def upgrade(self):
+        if self.level >= 3:
+            return False, 0
+        cost = self.cfg["upgrade_cost"][self.level - 1]
+        self.level += 1
+        self.dmg += self.cfg["dmg_add"]
+        self.range += self.cfg["range_add"]
+        self.total_cost += cost
+        return True, cost
+
+    # 获取升级价格
+    def get_upgrade_price(self):
+        if self.level >=3:
+            return 0
+        return self.cfg["upgrade_cost"][self.level -1]
+
+    # 出售返还50%总价
+    def get_sell_money(self):
+        return int(self.total_cost * 0.5)
+
+    def find_target(self, enemies):
+        self.target = None
+        max_progress = -1
+        for e in enemies:
+            dist = ((self.x - e.x)**2 + (self.y - e.y)**2)**0.5
+            if dist < self.range and e.path_idx > max_progress:
+                max_progress = e.path_idx
+                self.target = e
+
+    def attack(self, bullet_list, current_time):
+        if self.target and current_time - self.last_shot > self.cd:
+            self.last_shot = current_time
+            bullet_list.append(Bullet(self.x, self.y, self.target, self.dmg, self.splash))
+
+    # 绘制：完全移除炮管，只有纯色本体，无任何方向
+    def draw(self, screen, is_selected=False):
+        size_bonus = self.level * 3
+        if self.shape == "gun":
+            # 箭塔：纯方块，无白色炮头
+            pygame.draw.rect(screen, self.color, (self.x - 12 - size_bonus, self.y - 12 - size_bonus, 24 + size_bonus*2, 24 + size_bonus*2))
+        elif self.shape == "fort":
+            # 狙击堡垒：纯方块，无炮头
+            pygame.draw.rect(screen, self.color, (self.x - 16 - size_bonus, self.y - 16 - size_bonus, 32 + size_bonus*2, 32 + size_bonus*2))
+        elif self.shape == "cannon":
+            # 重炮塔：纯圆形，无炮头
+            r = 16 + size_bonus
+            pygame.draw.circle(screen, self.color, (self.x, self.y), r)
+        # 选中时黄色外框标记
+        if is_selected:
+            pygame.draw.rect(screen, (255,255,0), (self.x - 20 - size_bonus, self.y - 20 - size_bonus, 40 + size_bonus*2, 40 + size_bonus*2), 2)
+        # 等级文字
+        font_lv = pygame.font.Font(None, 22 + self.level*4)
+        lv_text = font_lv.render(f"Lv{self.level}", True, (255,255,255))
+        screen.blit(lv_text, (self.x - 15, self.y + 18))
+
+# ===================== 游戏主程序 =====================
+class TowerGame:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption("紫境塔防游戏")
+        self.clock = pygame.time.Clock()
+        self.running = True
+        self.state = STATE_MENU
+        self.select_map_idx = 0
+        self.select_tower_type = "arrow"
+        self.selected_tower = None # 右键选中的塔
+        self.tip_text = ""
+        self.tip_timer = 0
+
+        # 字体加载（已删除本地宋体，全部改为默认字体）
+        self.font_title = pygame.font.Font(None, 80)
+        self.font_btn = pygame.font.Font(None, 40)
+        self.font_ui = pygame.font.Font(None, 24)
+        self.font_tip = pygame.font.Font(None, 20) # 提示小号字体
+        self.font_mark = pygame.font.Font(None, 26)
+
+        self.menu_buttons = []
+        self.map_buttons = []
+        self.tower_buttons = []
+        self.operate_buttons = [] # 升级、出售按钮
+        self.init_menu_buttons()
+        self.init_map_buttons()
+        self.init_operate_buttons()
+
+        self.map_data = []
+        self.astar_solver = None
+        self.start_pos = (0, 12)
+        self.end_pos = (19, 12)
+        self.gold = 200
+        self.lives = 10
+        self.towers = []
+        self.enemies = []
+        self.bullets = []
+        self.spawn_timer = 0
+        self.game_over = False
+        self.enemy_types = ["normal", "fast", "tank"]
+        self.point_switch_timer = 0
+
+    # 自动搜索合法起点终点
+    def get_random_valid_start_end(self):
+        empty_cells = []
+        for y in range(GRID_ROWS):
+            for x in range(GRID_COLS):
+                if self.map_data[y][x] == 0:
+                    empty_cells.append((x, y))
+        if len(empty_cells) < 2:
+            return self.start_pos, self.end_pos
+        random.shuffle(empty_cells)
+        for i in range(len(empty_cells)):
+            sx, sy = empty_cells[i]
+            for j in range(i+1, len(empty_cells)):
+                ex, ey = empty_cells[j]
+                path = self.astar_solver.find_path(sx, sy, ex, ey)
+                if path is not None:
+                    return (sx, sy), (ex, ey)
+        return self.start_pos, self.end_pos
+
+    # 操作按钮：升级、回收出售
+    def init_operate_buttons(self):
+        base_x = GRID_COLS * CELL_SIZE + 8
+        self.btn_upgrade = Button(base_x, 570, 160, 42, "升级", self.font_ui, self.upgrade_tower)
+        self.btn_sell = Button(base_x, 620, 160, 42, "回收出售", self.font_ui, self.sell_tower)
+
+    # 升级塔回调
+    def upgrade_tower(self):
+        if not self.selected_tower or self.game_over:
+            self.tip_text = "请先右键选中一座防御塔"
+            self.tip_timer = 80
+            return
+        cost = self.selected_tower.get_upgrade_price()
+        if cost <= 0:
+            self.tip_text = "该塔已满级Lv3，无法升级"
+            self.tip_timer = 80
+            return
+        if self.gold < cost:
+            self.tip_text = f"金币不足，升级需要{cost}"
+            self.tip_timer = 80
+            return
+        ok, spend = self.selected_tower.upgrade()
+        if ok:
+            self.gold -= spend
+            self.refresh_all_enemy_paths()
+            self.tip_text = "升级成功！伤害、射程提升"
+            self.tip_timer = 80
+
+    # 出售回收塔回调
+    def sell_tower(self):
+        if not self.selected_tower or self.game_over:
+            self.tip_text = "请先右键选中一座防御塔"
+            self.tip_timer = 80
+            return
+        tower = self.selected_tower
+        get_money = tower.get_sell_money()
+        self.gold += get_money
+        self.map_data[tower.gy][tower.gx] = 0
+        self.towers.remove(tower)
+        self.selected_tower = None
+        self.refresh_all_enemy_paths()
+        self.tip_text = f"回收成功，获得{get_money}金币"
+        self.tip_timer = 80
+
+    def enter_s_map(self):
+        self.select_map_idx = 0
+        self.state = STATE_GAME
+        self.reset_map()
+
+    def enter_maze_map(self):
+        self.select_map_idx = 1
+        self.state = STATE_GAME
+        self.reset_map()
+
+    def open_map_select(self):
+        self.state = STATE_MAP_SELECT
+        self.selected_tower = None
+
+    def back_to_menu(self):
+        self.state = STATE_MENU
+        self.selected_tower = None
+
+    def exit_game(self):
+        self.running = False
+
+    def init_menu_buttons(self):
+        btn_width = 300
+        btn_height = 70
+        center_x = (SCREEN_WIDTH - btn_width) // 2
+        self.menu_buttons = [
+            Button(center_x, 280, btn_width, btn_height, "选择地图", self.font_btn, self.open_map_select),
+            Button(center_x, 370, btn_width, btn_height, "退出游戏", self.font_btn, self.exit_game)
+        ]
+
+    def init_map_buttons(self):
+        self.map_buttons = []
+        btn_width = 320
+        btn_height = 75
+        center_x = (SCREEN_WIDTH - btn_width) // 2
+        btn_back = Button(30, 620, 200, 65, "返回主菜单", self.font_btn, self.back_to_menu)
+        btn_s = Button(center_x, 270, btn_width, btn_height, "S弯紫境地图", self.font_btn, self.enter_s_map)
+        btn_maze = Button(center_x, 360, btn_width, btn_height, "迷宫紫境地图", self.font_btn, self.enter_maze_map)
+        self.map_buttons.append(btn_back)
+        self.map_buttons.append(btn_s)
+        self.map_buttons.append(btn_maze)
+
+    def init_tower_selector(self):
+        self.tower_buttons = []
+        y_pos = 400
+        base_x = GRID_COLS * CELL_SIZE + 8
+        for tower_id, config in TOWER_CONFIG.items():
+            def callback(t_id=tower_id):
+                self.select_tower_type = t_id
+                self.selected_tower = None # 切换建造塔取消选中
+            btn = Button(base_x, y_pos, 160, 42, f"{config['name']} 💰{config['cost']}", self.font_ui, callback)
+            self.tower_buttons.append(btn)
+            y_pos += 60
+
+    def reset_map(self):
+        map_info = MAP_LIST[self.select_map_idx]
+        self.start_pos = map_info["start"]
+        self.end_pos = map_info["end"]
+        self.map_data = [[0 for _ in range(GRID_COLS)] for _ in range(GRID_ROWS)]
+
+        for block in map_info["blocks"]:
+            if isinstance(block, list):
+                for (x, y) in block:
+                    if 0 <= x < GRID_COLS and 0 <= y < GRID_ROWS:
+                        self.map_data[y][x] = 1
+            else:
+                x, y = block
+                if 0 <= x < GRID_COLS and 0 <= y < GRID_ROWS:
+                    self.map_data[y][x] = 1
+
+        sx, sy = self.start_pos
+        ex, ey = self.end_pos
+        self.map_data[sy][sx] = 2
+        self.map_data[ey][ex] = 3
+
+        self.astar_solver = AStar(self.map_data)
+        self.gold = 200
+        self.lives = 10
+        self.towers.clear()
+        self.enemies.clear()
+        self.bullets.clear()
+        self.spawn_timer = 0
+        self.point_switch_timer = 0
+        self.game_over = False
+        self.selected_tower = None
+        self.init_tower_selector()
+        self.start_pos, self.end_pos = self.get_random_valid_start_end()
+
+    def can_build_tower(self, gx, gy):
+        if self.map_data[gy][gx] != 0:
+            return False
+        self.map_data[gy][gx] = 1
+        path = self.astar_solver.find_path(self.start_pos[0], self.start_pos[1], self.end_pos[0], self.end_pos[1])
+        self.map_data[gy][gx] = 0
+        return path is not None
+
+    def refresh_all_enemy_paths(self):
+        for enemy in self.enemies:
+            grid_x = int(enemy.x // CELL_SIZE)
+            grid_y = int(enemy.y // CELL_SIZE)
+            new_path = self.astar_solver.find_path(grid_x, grid_y, self.end_pos[0], self.end_pos[1])
+            if new_path:
+                enemy.path = new_path
+                enemy.path_idx = 0
+
+    def spawn_enemy(self):
+        random_type = random.choice(self.enemy_types)
+        path = self.astar_solver.find_path(self.start_pos[0], self.start_pos[1], self.end_pos[0], self.end_pos[1])
+        if path:
+            self.enemies.append(Enemy(path, random_type))
+
+    def handle_events(self):
+        mouse_pos = pygame.mouse.get_pos()
+        mx, my = mouse_pos
+        gx_m = mx // CELL_SIZE
+        gy_m = my // CELL_SIZE
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.state = STATE_MENU
+                    self.selected_tower = None
+            # 鼠标移动hover更新
+            if event.type == pygame.MOUSEMOTION:
+                if self.state == STATE_MENU:
+                    for btn in self.menu_buttons:
+                        btn.update_hover(mouse_pos)
+                elif self.state == STATE_MAP_SELECT:
+                    for btn in self.map_buttons:
+                        btn.update_hover(mouse_pos)
+                elif self.state == STATE_GAME:
+                    for btn in self.tower_buttons:
+                        btn.update_hover(mouse_pos)
+                    self.btn_upgrade.update_hover(mouse_pos)
+                    self.btn_sell.update_hover(mouse_pos)
+            # 左键点击核心修复
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.state == STATE_MENU:
+                    for btn in self.menu_buttons:
+                        if btn.rect.collidepoint(mouse_pos):
+                            btn.trigger_click()
+                elif self.state == STATE_MAP_SELECT:
+                    for btn in self.map_buttons:
+                        if btn.rect.collidepoint(mouse_pos):
+                            btn.trigger_click()
+                elif self.state == STATE_GAME and not self.game_over:
+                    click_op = False
+                    # 优先检测升级、回收按钮，先执行回调，不清空选中塔
+                    if self.btn_upgrade.rect.collidepoint(mouse_pos):
+                        self.btn_upgrade.trigger_click()
+                        click_op = True
+                    if self.btn_sell.rect.collidepoint(mouse_pos):
+                        self.btn_sell.trigger_click()
+                        click_op = True
+                    # 造塔按钮
+                    click_tower = False
+                    for btn in self.tower_buttons:
+                        if btn.rect.collidepoint(mouse_pos):
+                            btn.trigger_click()
+                            click_tower = True
+                    # 只有点击造塔/空白格子才清空选中塔，点升级回收不清空
+                    if click_tower or not click_op:
+                        self.selected_tower = None
+                    # 放置塔
+                    if 0 <= gx_m < GRID_COLS and 0 <= gy_m < GRID_ROWS:
+                        cost = TOWER_CONFIG[self.select_tower_type]["cost"]
+                        if self.gold >= cost and self.can_build_tower(gx_m, gy_m):
+                            self.gold -= cost
+                            self.map_data[gy_m][gx_m] = 1
+                            self.towers.append(Tower(gx_m, gy_m, self.select_tower_type))
+                            self.refresh_all_enemy_paths()
+            # 右键选中塔
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3 and self.state == STATE_GAME and not self.game_over:
+                self.selected_tower = None
+                for tower in self.towers:
+                    dist = ((mx - tower.x)**2 + (my - tower.y)**2)**0.5
+                    if dist < 30:
+                        self.selected_tower = tower
+                        break
+
+    def update_game_logic(self, delta_time):
+        if self.game_over:
+            return
+        current_time = pygame.time.get_ticks() / 1000
+        self.spawn_timer += delta_time
+        self.point_switch_timer += delta_time
+        if self.tip_timer > 0:
+            self.tip_timer -= delta_time * 60
+
+        if self.point_switch_timer >= POINT_SWITCH_INTERVAL:
+            self.start_pos, self.end_pos = self.get_random_valid_start_end()
+            self.refresh_all_enemy_paths()
+            self.point_switch_timer = 0
+
+        if self.spawn_timer > 1.8:
+            self.spawn_enemy()
+            self.spawn_timer = 0
+
+        alive_enemies = []
+        for enemy in self.enemies:
+            reach_end = enemy.update()
+            if reach_end:
+                self.lives -= 1
+                if self.lives <= 0:
+                    self.game_over = True
+                continue
+            if enemy.hp <= 0:
+                self.gold += enemy.reward
+                continue
+            alive_enemies.append(enemy)
+        self.enemies = alive_enemies
+
+        for tower in self.towers:
+            tower.find_target(self.enemies)
+            tower.attack(self.bullets, current_time)
+
+        alive_bullets = []
+        for bullet in self.bullets:
+            hit = bullet.update(self.enemies)
+            if not hit:
+                alive_bullets.append(bullet)
+        self.bullets = alive_bullets
+
+    def draw_game_screen(self):
+        self.screen.fill(BG_COLOR)
+        panel_x = GRID_COLS * CELL_SIZE
+        pygame.draw.rect(self.screen, UI_BG, (panel_x, 0, SCREEN_WIDTH - panel_x, SCREEN_HEIGHT))
+        # 网格
+        for x in range(GRID_COLS + 1):
+            pygame.draw.line(self.screen, GRID_LINE, (x * CELL_SIZE, 0), (x * CELL_SIZE, GRID_ROWS * CELL_SIZE))
+        for y in range(GRID_ROWS + 1):
+            pygame.draw.line(self.screen, GRID_LINE, (0, y * CELL_SIZE), (GRID_COLS * CELL_SIZE, y * CELL_SIZE))
+        # 障碍物
+        for y in range(GRID_ROWS):
+            for x in range(GRID_COLS):
+                if self.map_data[y][x] == 1:
+                    pygame.draw.rect(self.screen, BLOCK_COLOR, (x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE))
+        # 起点终点
+        sx, sy = self.start_pos
+        start_rect = pygame.Rect(sx * CELL_SIZE, sy * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+        pygame.draw.rect(self.screen, START_COLOR, start_rect)
+        start_text = self.font_mark.render("起点", True, (0,0,0))
+        self.screen.blit(start_text, start_text.get_rect(center=start_rect.center))
+        ex, ey = self.end_pos
+        end_rect = pygame.Rect(ex * CELL_SIZE, ey * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+        pygame.draw.rect(self.screen, END_COLOR, end_rect)
+        end_text = self.font_mark.render("终点", True, (255,255,255))
+        self.screen.blit(end_text, end_text.get_rect(center=end_rect.center))
+        # 绘制塔、怪物、子弹
+        for tower in self.towers:
+            tower.draw(self.screen, tower == self.selected_tower)
+        for enemy in self.enemies:
+            enemy.draw(self.screen)
+        for bullet in self.bullets:
+            bullet.draw(self.screen)
+
+        # 顶部状态文字
+        base_y = 20
+        line_gap = 30
+        info_lines = [
+            f"金币: {self.gold}",
+            f"生命: {self.lives}",
+            f"地图: {MAP_LIST[self.select_map_idx]['name']}",
+            f"起点: {self.start_pos}",
+            f"终点: {self.end_pos}",
+            f"切换倒计时: {round(POINT_SWITCH_INTERVAL - self.point_switch_timer, 1)}s",
+            f"建造塔: {TOWER_CONFIG[self.select_tower_type]['name']}",
+            "右键点塔选中",
+            "ESC返回菜单"
+        ]
+        for idx, line in enumerate(info_lines):
+            surf = self.font_ui.render(line, True, (255,255,255))
+            self.screen.blit(surf, (panel_x + 10, base_y + idx * line_gap))
+
+        # 选中塔详情
+        detail_start_y = 300
+        if self.selected_tower:
+            t = self.selected_tower
+            detail_lines = [
+                f"{t.cfg['name']} Lv{t.level}",
+                f"伤害:{t.dmg} 射程:{int(t.range)}",
+                f"升级:{t.get_upgrade_price()}",
+                f"出售:{t.get_sell_money()}"
+            ]
+            for idx, line in enumerate(detail_lines):
+                surf = self.font_ui.render(line, True, GOLD_TEXT)
+                self.screen.blit(surf, (panel_x + 8, detail_start_y + idx * 26))
+
+        # 绘制造塔、升级、回收按钮
+        for btn in self.tower_buttons:
+            btn.draw(self.screen)
+        self.btn_upgrade.draw(self.screen)
+        self.btn_sell.draw(self.screen)
+
+        # 提示文字：放在回收出售按钮下方，靠近底部 Y=670
+        if self.tip_timer > 0:
+            tip_surf = self.font_tip.render(self.tip_text, True, TIP_COLOR)
+            self.screen.blit(tip_surf, (panel_x + 8, 670))
+
+        # 游戏结束
+        if self.game_over:
+            over_text = self.font_title.render("游戏结束", True, (255,0,0))
+            rect = over_text.get_rect(center=(GRID_COLS * CELL_SIZE // 2, SCREEN_HEIGHT // 2))
+            self.screen.blit(over_text, rect)
+        pygame.display.flip()
+
+    def run(self):
+        while self.running:
+            delta = self.clock.tick(FPS) / 1000
+            self.handle_events()
+            if self.state == STATE_MENU:
+                self.draw_menu_screen()
+            elif self.state == STATE_MAP_SELECT:
+                self.draw_map_select_screen()
+            elif self.state == STATE_GAME:
+                self.update_game_logic(delta)
+                self.draw_game_screen()
+        pygame.quit()
+        sys.exit()
+
+if __name__ == "__main__":
+    game = TowerGame()
+    game.run()
+`;
+    // 执行游戏代码
+    pyodide.runPython(game_code);
+}
+runGame();
+</script>
+</body>
+</html>
